@@ -24,8 +24,104 @@ function yourls_db_sqlite_connect() {
     
     // Custom tables to be created upon install
     yourls_add_filter( 'shunt_yourls_create_sql_tables', 'yourls_create_sqlite_tables' );
+
+    // Custom stat query to replace MySQL DATE_FORMAT with SQLite strftime
+    yourls_add_filter( 'stat_query_dates', 'yourls_sqlite_stat_query_dates' );
+    
+    // Custom stat query to get last 24 hours hits
+    yourls_add_filter( 'stat_query_last24h', create_function( '', 'return "SELECT 1;";') ); // just bypass original query
+    yourls_add_filter( 'pre_yourls_info_last_24h', 'yourls_sqlite_last_24h_hits' );         // use this one instead
     
     return $ydb;
+}
+
+
+/**
+ * Custom SQLite query to get last 24 hours hits on a URL
+ *
+ * Just a little difference: the original MySQL query generates an array of [hour AM/PM] => [hits] but SQLite doesn't
+ * understand AM & PM.
+ * Originally we make an array with :
+ * $h = date('H A', $now - ($i * 60 * 60) );
+ * Due to this limitation, the array is crafted with:
+ * $h = date('H', $now - ($i * 60 * 60) );
+ *
+ * Yep, all that for that simple 'H' instead of 'H A'
+ *
+ * @return array Last 24 hour hits
+ */
+function yourls_sqlite_last_24h_hits() {
+    $table = YOURLS_DB_TABLE_LOG;
+    $last_24h = array();
+    
+    global $ydb;
+    global $keyword, $aggregate; // as defined in yourls-loader.php
+    
+	// Define keyword query range : either a single keyword or a list of keywords
+	if( $aggregate ) {
+		$keyword_list = yourls_get_longurl_keywords( $longurl );
+		$keyword_range = "IN ( '" . join( "', '", $keyword_list ) . "' )"; // IN ( 'blah', 'bleh', 'bloh' )
+	} else {
+		$keyword_range = sprintf( "= '%s'", yourls_escape( $keyword ) );
+	}
+    
+	$query = "SELECT
+		strftime('%H', `click_time`) AS `time`,
+		COUNT(*) AS `count`
+	FROM `yourls_log`
+	WHERE `shorturl` $keyword_range AND `click_time` > datetime('now', '-1 day')
+	GROUP BY `time`;";
+	$rows = $ydb->get_results( $query );
+    
+    $_last_24h = array();
+	foreach( (array)$rows as $row ) {
+		if ( $row->time )
+			$_last_24h[ "$row->time" ] = $row->count;
+	}
+    
+    $now = intval( date('U') );
+	for ($i = 23; $i >= 0; $i--) {
+		$h = date('H', $now - ($i * 60 * 60) );
+		// If the $last_24h doesn't have all the hours, insert missing hours with value 0
+		$last_24h[ $h ] = array_key_exists( $h, $_last_24h ) ? $_last_24h[ $h ] : 0 ;
+	}
+    
+    return( $last_24h );
+}
+
+
+/**
+ * Format SQL queries for SQLite
+ *
+ * Replace all
+ *    DATE_FORMAT(`field`, '%FORMAT')        with    strftime('%FORMAT', `field`)
+ *    (CURRENT_TIMESTAMP - INTERVAL 1 DAY)   with    datetime('now', '-1 day')
+ *    Date format string that SQLite doesn't understand (eg "%p")
+ *
+ * @param string $query Query
+ * @return string Modified query
+ */
+function yourls_sqlite_stat_query_dates( $query ) {
+    // from: DATE_FORMAT(`field`, '%FORMAT')
+    // to:   strftime('%FORMAT', `field`)
+    preg_match_all( '/DATE_FORMAT\(\s*([^,]+),\s*([^\)]+)\)/', $query, $matches );
+    // $matches[0] is an array of all the "DATE_FORMAT(`THING`, '%STUFF')"
+    // $matches[1] is an array of all the `THING`
+    // $matches[2] is an array of all the '%STUFF'
+    $replace = array();
+    foreach( $matches[1] as $k => $v ) {
+        $replace[] = sprintf( 'strftime(%s, %s)', $matches[2][$k], $matches[1][$k] );
+    }
+    $query = str_replace( $matches[0], $replace, $query );
+    
+    // from: `field` > (CURRENT_TIMESTAMP - INTERVAL 1 DAY)
+    // to:   `field` > datetime('now', '-1 day');
+    $query = str_replace( "(CURRENT_TIMESTAMP - INTERVAL 1 DAY)", "datetime('now', '-1 day')", $query );    
+    
+    // Remove %p from date formats, as SQLite doesn't get it
+    $query = preg_replace( '/\s*%p\s*/', '', $query );    
+    
+    return $query;
 }
 
 
