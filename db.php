@@ -1,7 +1,12 @@
 <?php
+/*
+SQLite driver for YOURLS.
+Version: 1.0
+This driver requires YOURLS 1.7.1 or YOURLS 1.7.2 -- not before -- not after!
+Author: Ozh
+*/
 
 yourls_db_sqlite_connect();
-
 
 /**
  * Connect to SQLite DB
