@@ -1,8 +1,8 @@
 <?php
 /*
 SQLite driver for YOURLS.
-Version: 1.0
-This driver requires YOURLS 1.7.1 or YOURLS 1.7.2 -- not before -- not after!
+Version: 1.1
+This driver requires YOURLS 1.7.3 -- not before -- not after!
 Author: Ozh
 */
 
@@ -14,19 +14,37 @@ yourls_db_sqlite_connect();
 function yourls_db_sqlite_connect() {
     global $ydb;
 
-    // Use core PDO library
-    require_once( YOURLS_INC . '/ezSQL/ez_sql_core.php' );
-    require_once( YOURLS_INC . '/ezSQL/ez_sql_core_yourls.php' );
-    require_once( YOURLS_INC . '/ezSQL/ez_sql_pdo.php' );
-    // Overwrite core PDO YOURLS library to allow connection to a SQLite DB instead of a MySQL server
-    require_once( YOURLS_USERDIR . '/ez_sql_pdo_sqlite_yourls.php' );
+	if (!defined( 'YOURLS_DB_NAME' ))
+        yourls_die ( yourls__( 'Incorrect DB config (set YOURLS_DB_NAME)' ), yourls__( 'Fatal error' ), 503 );
 
     $dbname = YOURLS_USERDIR . '/' . YOURLS_DB_NAME . '.sq3';
-    $ydb = new ezSQL_pdo_sqlite_YOURLS( YOURLS_DB_USER, YOURLS_DB_PASS, $dbname, YOURLS_DB_HOST );
-    $ydb->DB_driver = 'sqlite3';
 
-    yourls_debug_log( "DB driver: sqlite3" );
-    
+    /**
+     * Data Source Name (dsn) used to connect the DB
+     *
+     * DSN with PDO is something like:
+     * 'mysql:host=123.4.5.6;dbname=test_db;port=3306'
+     * 'sqlite:/opt/databases/mydb.sq3'
+     * 'pgsql:host=192.168.13.37;port=5432;dbname=omgwtf'
+     */
+    $dsn = sprintf( 'sqlite:%s', $dbname );
+
+    /**
+     * PDO driver options and attributes
+
+     * The PDO constructor is something like:
+     *   new PDO( string $dsn, string $username, string $password [, array $options ] )
+     * The driver options are passed to the PDO constructor, eg array(PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION)
+     * The attribute options are then set in a foreach($attr as $k=>$v){$db->setAttribute($k, $v)} loop
+     */
+    $attributes     = yourls_apply_filter( 'db_connect_attributes',    array() ); // attributes as key-value pairs
+
+    $ydb = new \YOURLS\Database\YDB( $dsn, "", "", array(), $attributes );
+    $ydb->init();
+
+    // Past this point, we're connected
+    yourls_debug_log(sprintf('Opened database %s ', $dbname, $dbhost));
+
     // Custom tables to be created upon install
     yourls_add_filter( 'shunt_yourls_create_sql_tables', 'yourls_create_sqlite_tables' );
 
@@ -36,10 +54,57 @@ function yourls_db_sqlite_connect() {
     // Custom stat query to get last 24 hours hits
     yourls_add_filter( 'stat_query_last24h', create_function( '', 'return "SELECT 1;";') ); // just bypass original query
     yourls_add_filter( 'pre_yourls_info_last_24h', 'yourls_sqlite_last_24h_hits' );         // use this one instead
+
+    // Return version for compat
+    yourls_add_filter( 'shunt_get_database_version', create_function( '', 'return "5.0";') );
+
+    // Shunt get_all_options to prevent error from SHOW TABLES query
+    yourls_add_filter( 'shunt_all_options', 'yourls_sqlite_get_all_options' );
     
-    return $ydb;
+    yourls_debug_mode(YOURLS_DEBUG);
+
+	return $ydb;
 }
 
+function yourls_sqlite_get_all_options() {
+    // Options uses a SHOW TABLES query to check if YOURLS is installed.
+    // However, sqlite doesn't support that, and it hard dies there.
+    // This does the equivalent in sqlite.
+    global $ydb;
+    $table = YOURLS_DB_TABLE_OPTIONS;
+    $sql = "SELECT option_name, option_value FROM $table WHERE 1=1";
+
+    try {
+        $options = (array) $ydb->fetchPairs($sql);
+    } catch ( PDOException $e ) {
+        try {
+            $check = $ydb->fetchAffected(
+                sprintf(
+                    'SELECT name FROM sqlite_master WHERE type = "table" AND ' .
+                    'name LIKE "%s"', $table));
+            // Table doesn't exist. Set installed to false and short circuit.
+            if ($check == 0) {
+                $ydb->set_installed(false);
+                return true;
+            }
+        // Error at this point means the database isn't readable
+        } catch ( PDOException $e ) {
+            $ydb->dead_or_error($e);
+        }
+    }
+
+    // Unlikely scenario, but who knows: table exists, but is empty
+    if (empty($options)) {
+        return false;
+    }
+
+    foreach ($options as $name => $value) {
+        $ydb->set_option($name, yourls_maybe_unserialize($value));
+    }
+
+    $ydb->set_installed(true);
+    return true;
+}
 
 /**
  * Custom SQLite query to get last 24 hours hits on a URL
@@ -129,33 +194,6 @@ function yourls_sqlite_stat_query_dates( $query ) {
     return $query;
 }
 
-
-/**
- * Assume SQLite server is always alive
- */
-function yourls_is_db_alive() {
-    return true;
-}
-
-
-/**
- * Die with a DB error message
- *
- * @TODO in version 1.8 : use a new localized string, specific to the problem (ie: "DB is dead")
- *
- * @since 1.7.1
- */
-function yourls_db_dead() {
-    // Use any /user/db_error.php file
-    if( file_exists( YOURLS_USERDIR . '/db_error.php' ) ) {
-        include_once( YOURLS_USERDIR . '/db_error.php' );
-        die();
-    }
-
-    yourls_die( yourls__( 'Incorrect DB config, or could not connect to DB' ), yourls__( 'Fatal error' ), 503 );
-}
-
-
 /**
  * Create tables. Return array( 'success' => array of success strings, 'errors' => array of error strings )
  *
@@ -204,14 +242,15 @@ function yourls_create_sqlite_tables() {
     
     // Create tables
     foreach ( $create_tables as $table_name => $table_query ) {
-        $ydb->query( $table_query );
+        $ydb->perform( $table_query );
     }    
 
     // Get list of created tables
-    $create_success = $ydb->get_results( 'SELECT name FROM sqlite_master WHERE type = "table"' );
+    $create_success = $ydb->fetchObjects( 'SELECT name FROM sqlite_master WHERE type = "table" AND name NOT LIKE "sqlite_%"' );
     
     $created_tables = [];
-    foreach( (array)$create_success as $table ) {
+    $i = 0;
+    foreach( $create_success as $table ) {
         $created_tables[] = $table->name;
     }
     
@@ -221,7 +260,7 @@ function yourls_create_sqlite_tables() {
             $create_table_count++;
             $success_msg[] = yourls_s( "Table '%s' created.", $table_name ); 
         } else {
-            $error_msg[] = yourls_s( "Error creating table '%s'.", $table_name ); 
+            $error_msg[] = yourls_s( "Error creating table '%s'.", $table_name );
         }
     }
     
